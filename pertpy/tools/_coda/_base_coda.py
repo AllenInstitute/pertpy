@@ -41,7 +41,6 @@ if TYPE_CHECKING:
 
 config.update("jax_enable_x64", True)
 
-
 class CompositionalModel2(ABC):
     """General compositional model framework for scCODA-type models.
 
@@ -226,19 +225,29 @@ class CompositionalModel2(ABC):
         numpyro_covariates = jnp.array(sample_adata.obsm["covariate_matrix"], dtype=dtype)
         numpyro_n_total = jnp.array(sample_adata.obsm["sample_counts"], dtype=dtype)
 
+        # Extract one-hot encoded region labels
+        region_labels_onehot = jnp.array(sample_adata.obsm["region_labels"])  # Shape (N, R)
+        num_regions = region_labels_onehot.shape[1]  # Extract number of regions
+    
+        # Extract the cell type presence mask
+        cell_type_region_mask = jnp.array(sample_adata.obsm["cell_type_region_mask"])
+
+
         # Create mcmc attribute and run inference
-        self.mcmc = MCMC(kernel, *args, **kwargs)
+        self.mcmc = MCMC(kernel, chain_method="vectorized", *args, **kwargs)
         self.mcmc.run(
             rng_key,
             numpyro_counts,
             numpyro_covariates,
             numpyro_n_total,
-            jnp.array(sample_adata.uns["scCODA_params"]["reference_index"]),
-            sample_adata,
+            sample_adata.uns["scCODA_params"]["reference_index"],
+            region_labels_onehot,  # Pass one-hot encoded regions
+            cell_type_region_mask,
             extra_fields=extra_fields,
         )
+        
+        acc_rate = np.mean(self.mcmc.last_state.mean_accept_prob)
 
-        acc_rate = np.array(self.mcmc.last_state.mean_accept_prob)
         if acc_rate < 0.6:
             logger.warning(
                 f"Acceptance rate unusually low ({acc_rate} < 0.5)! Results might be incorrect! "
@@ -250,27 +259,28 @@ class CompositionalModel2(ABC):
                 f"Please check feasibility of results and re-run the sampling step with a different rng_key if necessary."
             )
 
+        
         # Set acceptance rate and save sampled values to `sample_adata.uns`
         sample_adata.uns["scCODA_params"]["mcmc"]["acceptance_rate"] = np.array(self.mcmc.last_state.mean_accept_prob)
         samples = self.mcmc.get_samples()
         for k, v in samples.items():
             samples[k] = np.array(v)
         sample_adata.uns["scCODA_params"]["mcmc"]["samples"] = samples
-
+        
         # Evaluate results and create result dataframes (based on tree-aggregation or not)
         if sample_adata.uns["scCODA_params"]["model_type"] == "classic":
             intercept_df, effect_df = self.summary_prepare(sample_adata)  # type: ignore
-        elif sample_adata.uns["scCODA_params"]["model_type"] == "tree_agg":
-            intercept_df, effect_df, node_df = self.summary_prepare(sample_adata)  # type: ignore
-            # Save node df in `sample_adata.uns`
-            sample_adata.uns["scCODA_params"]["node_df"] = node_df
         else:
             raise ValueError("No valid model type!")
-
+        
         # Save intercept and effect dfs in `sample_adata.varm` (one effect df per covariate)
-        sample_adata.varm["intercept_df"] = intercept_df
-        for cov in effect_df.index.get_level_values("Covariate"):
-            sample_adata.varm[f"effect_df_{cov}"] = effect_df.loc[cov, :]
+        for region in intercept_df.index.get_level_values("Region").unique():
+            sample_adata.varm[f"intercept_df_{region}"] = intercept_df.loc[region, :]
+
+        for region in effect_df.index.get_level_values("Region").unique():
+            for cov in effect_df.index.get_level_values("Covariate").unique():
+                sample_adata.varm[f"effect_df_{region}_{cov}"] = effect_df.loc[(region, cov), :]
+        
         if copy:
             return sample_adata
 
@@ -278,6 +288,7 @@ class CompositionalModel2(ABC):
         self,
         data: AnnData | MuData,
         modality_key: str = "coda",
+        num_chains: int = 1,
         num_samples: int = 10000,
         num_warmup: int = 1000,
         rng_key: int = 0,
@@ -324,7 +335,7 @@ class CompositionalModel2(ABC):
         sample_adata.uns["scCODA_params"]["mcmc"]["algorithm"] = "NUTS"
 
         return self.__run_mcmc(
-            sample_adata, nuts_kernel, num_samples=num_samples, num_warmup=num_warmup, rng_key=rng_key_array, copy=copy
+            sample_adata, nuts_kernel, num_chains=num_chains, num_samples=num_samples, num_warmup=num_warmup, rng_key=rng_key_array, copy=copy
         )
 
     def run_hmc(
@@ -393,7 +404,7 @@ class CompositionalModel2(ABC):
         )
 
     def summary_prepare(
-        self, sample_adata: AnnData, est_fdr: float = 0.05, *args, **kwargs
+        self, sample_adata: AnnData, est_fdr: float = 0.1, *args, **kwargs
     ) -> tuple[pd.DataFrame, pd.DataFrame] | tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """Generates summary dataframes for intercepts, effects and node-level effect (if using tree aggregation).
             This function builds on and supports all functionalities from ``az.summary``.
@@ -449,186 +460,161 @@ class CompositionalModel2(ABC):
         model_type = sample_adata.uns["scCODA_params"]["model_type"]
 
         # Create arviz summary for intercepts, effects and node effects
-        if model_type == "tree_agg":
-            var_names = ["alpha", "b_tilde", "beta"]
-        elif model_type == "classic":
-            var_names = ["alpha", "beta"]
-        else:
-            raise ValueError("No valid model type!")
-
+        var_names = ["alpha_per_region", "beta_full", "beta_region_specific"]
+        
+        # Run ArviZ summary
         summ = az.summary(
             data=self.make_arviz(sample_adata, num_prior_samples=0, use_posterior_predictive=False),
             var_names=var_names,
             kind="stats",
             stat_funcs={"median": np.median},
-            *args,  # noqa: B026
+            *args,  
             **kwargs,
-        )  # type: ignore
+        )  
 
-        effect_df = summ.loc[summ.index.str.match("|".join([r"beta\["]))].copy()
-        intercept_df = summ.loc[summ.index.str.match("|".join([r"alpha\["]))].copy()
-
-        # Build neat index
+        # Separate shared and region-specific effects
+        shared_effects_df = summ.loc[summ.index.str.match("|".join([r"beta_full\["]))].copy()
+        region_effects_df = summ.loc[summ.index.str.match("|".join([r"beta_region_specific\["]))].copy()
+        intercept_df = summ.loc[summ.index.str.match("|".join([r"alpha_per_region\["]))].copy()
+        
+        # Indexing
         cell_types = sample_adata.var.index.to_list()
         covariates = sample_adata.uns["scCODA_params"]["covariate_names"]
+        regions = sample_adata.uns["scCODA_params"]["region_names"]
 
-        intercept_df.index = pd.Index(cell_types, name="Cell Type")
-        effect_df.index = pd.MultiIndex.from_product([covariates, cell_types], names=["Covariate", "Cell Type"])
-        intercept_df = self.__complete_alpha_df(sample_adata, intercept_df)
+        intercept_df.index = pd.MultiIndex.from_product([regions, cell_types], names=["Region", "Cell Type"])
+        shared_effects_df.index = pd.MultiIndex.from_product([["Global"], covariates, cell_types], names=["Region", "Covariate", "Cell Type"])
+        region_effects_df.index = pd.MultiIndex.from_product([regions, covariates, cell_types], names=["Region", "Covariate", "Cell Type"])
 
-        # Processing only if using tree aggregation
-        if model_type == "tree_agg":
-            node_df = summ.loc[summ.index.str.match("|".join([r"b_tilde\["]))].copy()
+        intercept_df = intercept_df.rename(columns={"mean": "final_parameter"})
 
-            # Neat index for node df
-            node_names = sample_adata.uns["scCODA_params"]["node_names"]
-            covariates_node = [x + "_node" for x in covariates]
-            node_df.index = pd.MultiIndex.from_product([covariates_node, node_names], names=["Covariate", "Node"])
-
-            # Complete node df
-            node_df = self.__complete_node_df(sample_adata, node_df)
-
-            # Complete effect df
-            effect_df = self.__complete_beta_df(
-                sample_adata,
-                intercept_df,
-                effect_df,
-                target_fdr=est_fdr,
-                model_type="tree_agg",
-                select_type=select_type,
-                node_df=node_df,
-            )
-        else:
-            # Complete effect df
-            effect_df = self.__complete_beta_df(
-                sample_adata, intercept_df, effect_df, target_fdr=est_fdr, select_type=select_type, model_type="classic"
-            )
+        # Complete effect df
+        shared_effects_df = self.__complete_beta_df(
+            sample_adata, intercept_df, shared_effects_df, "beta_full", target_fdr=est_fdr,
+        )
+        region_effects_df = self.__complete_beta_df(
+            sample_adata, intercept_df, region_effects_df, "beta_region_specific", target_fdr=est_fdr,
+        )
 
         # Give nice column names, remove unnecessary columns
         hdis = intercept_df.columns[intercept_df.columns.str.contains("hdi")]
         hdis_new = hdis.str.replace("hdi_", "HDI ")
 
         # Calculate credible intervals if using classical spike-and-slab
-        if select_type == "spikeslab":
-            # Credible interval
-            ind_post = np.array(sample_adata.uns["scCODA_params"]["mcmc"]["samples"]["ind"])
-            ind_post[ind_post < 1e-3] = np.nan
+        ind_post_shared = np.array(sample_adata.uns["scCODA_params"]["mcmc"]["samples"]["ind_shared"])
+        ind_post_shared[ind_post_shared < 1e-3] = np.nan
 
-            b_raw_sel = np.array(sample_adata.uns["scCODA_params"]["mcmc"]["samples"]["b_raw"]) * ind_post
+        b_raw_sel_shared = np.array(sample_adata.uns["scCODA_params"]["mcmc"]["samples"]["b_offset_shared"]) * ind_post_shared
 
-            res = az.convert_to_inference_data(np.array([b_raw_sel]))
+        res_shared = az.convert_to_inference_data(np.array([b_raw_sel_shared]))
 
-            summary_sel = az.summary(
-                data=res,
-                kind="stats",
-                var_names=["x"],
-                skipna=True,
-                *args,  # noqa: B026
-                **kwargs,
+        summary_sel = az.summary(
+            data=res_shared,
+            kind="stats",
+            var_names=["x"],
+            skipna=True,
+            *args,  # noqa: B026
+            **kwargs,
+        )
+        
+        ref_index = sample_adata.uns["scCODA_params"]["reference_index"]
+        n_conditions = len(covariates)
+        n_cell_types = len(cell_types)
+
+        def insert_row(idx, df, df_insert):
+            return pd.concat(
+                [
+                    df.iloc[:idx,],
+                    df_insert,
+                    df.iloc[idx:,],
+                ]
+            ).reset_index(drop=True)
+
+        for i in range(n_conditions):
+            summary_sel = insert_row(
+                (i * n_cell_types) + ref_index,
+                summary_sel,
+                pd.DataFrame.from_dict(data={"mean": [0], "sd": [0], hdis[0]: [0], hdis[1]: [0]}),
             )
 
-            ref_index = sample_adata.uns["scCODA_params"]["reference_index"]
-            n_conditions = len(covariates)
-            n_cell_types = len(cell_types)
+        shared_effects_df.loc[:, hdis[0]] = list(summary_sel[hdis[0]])
+        shared_effects_df.loc[:, hdis[1]] = list(summary_sel.loc[:, hdis[1]])  # type: ignore
 
-            def insert_row(idx, df, df_insert):
-                return pd.concat(
-                    [
-                        df.iloc[:idx,],
-                        df_insert,
-                        df.iloc[idx:,],
-                    ]
-                ).reset_index(drop=True)
+        # Calculate credible intervals if using classical spike-and-slab
+        ind_post_region = np.array(sample_adata.uns["scCODA_params"]["mcmc"]["samples"]["ind_region"])
+        ind_post_region[ind_post_region < 1e-3] = np.nan
 
+        b_raw_sel_region = np.array(sample_adata.uns["scCODA_params"]["mcmc"]["samples"]["b_offset_region"]) * ind_post_region
+
+        res_region = az.convert_to_inference_data(np.array([b_raw_sel_region]))
+
+        summary_sel = az.summary(
+            data=res_region,
+            kind="stats",
+            var_names=["x"],
+            skipna=True,
+            *args,  # noqa: B026
+            **kwargs,
+        )
+
+        ref_index = sample_adata.uns["scCODA_params"]["reference_index"]
+        n_regions = len(regions)
+        n_conditions = len(covariates)
+        n_cell_types = len(cell_types)
+
+        for j in range(n_regions):
             for i in range(n_conditions):
                 summary_sel = insert_row(
-                    (i * n_cell_types) + ref_index,
+                    (j * n_conditions * n_cell_types) + (i * n_cell_types) + ref_index,
                     summary_sel,
                     pd.DataFrame.from_dict(data={"mean": [0], "sd": [0], hdis[0]: [0], hdis[1]: [0]}),
                 )
 
-            effect_df.loc[:, hdis[0]] = list(summary_sel[hdis[0]])
-            effect_df.loc[:, hdis[1]] = list(summary_sel.loc[:, hdis[1]])  # type: ignore
-        # For spike-and-slab LASSO, credible intervals are as calculated by `az.summary`
-        elif select_type == "sslasso":
-            pass
-        else:
-            raise ValueError("No valid select type!")
+        region_effects_df.loc[:, hdis[0]] = list(summary_sel[hdis[0]])
+        region_effects_df.loc[:, hdis[1]] = list(summary_sel.loc[:, hdis[1]])  # type: ignore
+
+        effect_df = pd.concat([shared_effects_df, region_effects_df], axis=0)
 
         # Select relevant columns and give nice column names for all result dfs, then return them
-        intercept_df = intercept_df.loc[:, ["final_parameter", hdis[0], hdis[1], "sd", "expected_sample"]].copy()
+        intercept_df = intercept_df.loc[:, ["final_parameter", hdis[0], hdis[1], "sd"]].copy()
         intercept_df = intercept_df.rename(
             columns=dict(
                 zip(
                     intercept_df.columns,
-                    ["Final Parameter", hdis_new[0], hdis_new[1], "SD", "Expected Sample"],
+                    ["Final Parameter", hdis_new[0], hdis_new[1], "SD"],
+                    strict=False,
+                )
+            )
+        )
+    
+        effect_df = effect_df.loc[
+            :, ["final_parameter", hdis[0], hdis[1], "sd", "inclusion_prob"]
+        ].copy()
+        effect_df = effect_df.rename(
+            columns=dict(
+                zip(
+                    effect_df.columns,
+                    [
+                        "Final Parameter",
+                        hdis_new[0],
+                        hdis_new[1],
+                        "SD",
+                        "Inclusion probability",
+                    ],
                     strict=False,
                 )
             )
         )
 
-        if select_type == "sslasso":
-            effect_df = effect_df.loc[
-                :, ["final_parameter", "median", hdis[0], hdis[1], "sd", "expected_sample", "log_fold"]
-            ].copy()
-            effect_df = effect_df.rename(
-                columns=dict(
-                    zip(
-                        effect_df.columns,
-                        ["Effect", "Median", hdis_new[0], hdis_new[1], "SD", "Expected Sample", "log2-fold change"],
-                        strict=False,
-                    )
-                )
-            )
-        else:
-            effect_df = effect_df.loc[
-                :, ["final_parameter", hdis[0], hdis[1], "sd", "inclusion_prob", "expected_sample", "log_fold"]
-            ].copy()
-            effect_df = effect_df.rename(
-                columns=dict(
-                    zip(
-                        effect_df.columns,
-                        [
-                            "Final Parameter",
-                            hdis_new[0],
-                            hdis_new[1],
-                            "SD",
-                            "Inclusion probability",
-                            "Expected Sample",
-                            "log2-fold change",
-                        ],
-                        strict=False,
-                    )
-                )
-            )
-
-        if model_type == "tree_agg":
-            node_df = node_df.loc[
-                :, ["final_parameter", "median", hdis[0], hdis[1], "sd", "delta", "significant"]
-            ].copy()  # type: ignore
-            node_df = node_df.rename(
-                columns=dict(
-                    zip(
-                        node_df.columns,
-                        ["Final Parameter", "Median", hdis_new[0], hdis_new[1], "SD", "Delta", "Is credible"],
-                        strict=False,
-                    )
-                )  # type: ignore
-            )  # type: ignore
-
-            return intercept_df, effect_df, node_df
-        else:
-            return intercept_df, effect_df
+        return intercept_df, effect_df
 
     def __complete_beta_df(
         self,
         sample_adata: AnnData,
         intercept_df: pd.DataFrame,
         effect_df: pd.DataFrame,
-        model_type: str,
-        select_type: str,
-        target_fdr: float = 0.05,
-        node_df: pd.DataFrame = None,
+        mcmc_beta_key: str,
+        target_fdr: float = 0.1,
     ) -> pd.DataFrame:
         """Evaluation of MCMC results for effect parameters. This function is only used within self.summary_prepare.
 
@@ -639,27 +625,23 @@ class CompositionalModel2(ABC):
             intercept_df: Intercept summary, see ``summary_prepare``
             effect_df: Effect summary, see ``summary_prepare``
             model_type: String indicating the model type ("classic" or "tree_agg")
-            select_type:  String indicating the type of spike_and_slab selection ("spikeslab" or "sslasso")
             target_fdr: Desired FDR value.
             node_df: If using tree aggregation, the node-level effect DataFrame must be passed.
 
         Returns:
             pd.DataFrame:  effect DataFrame with inclusion probability, final parameters, expected sample.
         """
-        # Data dimensions
-        D = len(effect_df.index.levels[0])
-        K = len(effect_df.index.levels[1])
 
         # Effect processing for different models
         # Classic scCODA (spike-and-slab + no tree aggregation)
-        if model_type == "classic" and select_type == "spikeslab":
-            beta_inc_prob = []
-            beta_nonzero_mean = []
+        beta_inc_prob = []
+        beta_nonzero_mean = []
 
-            # Get MCMC samples for parameter "beta"
-            beta_raw = np.array(sample_adata.uns["scCODA_params"]["mcmc"]["samples"]["beta"])
-
-            # Calculate inclusion prob, nonzero mean for every effect
+        # Get MCMC samples for parameter "beta"
+        beta_raw = np.array(sample_adata.uns["scCODA_params"]["mcmc"]["samples"][mcmc_beta_key])
+        
+        # Calculate inclusion prob, nonzero mean for every effect
+        if len(beta_raw.shape) == 3:
             for j in range(beta_raw.shape[1]):
                 for i in range(beta_raw.shape[2]):
                     beta_i_raw = beta_raw[:, j, i]
@@ -671,122 +653,51 @@ class CompositionalModel2(ABC):
                     else:
                         beta_nonzero_mean.append(0)
 
-            effect_df.loc[:, "inclusion_prob"] = beta_inc_prob
-            effect_df.loc[:, "mean_nonzero"] = beta_nonzero_mean
+        elif len(beta_raw.shape) == 4:
+            for j in range(beta_raw.shape[1]):
+                for i in range(beta_raw.shape[2]):
+                    for k in range(beta_raw.shape[3]):
+                        beta_i_raw = beta_raw[:, j, i, k]
+                        beta_i_raw_nonzero = np.where(np.abs(beta_i_raw) > 1e-3)[0]
+                        prob = beta_i_raw_nonzero.shape[0] / beta_i_raw.shape[0]
+                        beta_inc_prob.append(prob)
+                        if len(beta_i_raw[beta_i_raw_nonzero]) > 0:
+                            beta_nonzero_mean.append(beta_i_raw[beta_i_raw_nonzero].mean())
+                        else:
+                            beta_nonzero_mean.append(0)
+        else:
+            raise ValueError("To many dimensions in the effect size table.")
 
-            # Inclusion prob threshold value. Direct posterior probability approach cf. Newton et al. (2004)
-            def opt_thresh(result, alpha):
-                incs = np.array(result.loc[result["inclusion_prob"] > 0, "inclusion_prob"])
-                incs[::-1].sort()
+        effect_df.loc[:, "inclusion_prob"] = beta_inc_prob
+        effect_df.loc[:, "mean_nonzero"] = beta_nonzero_mean
 
-                for c in np.unique(incs):
-                    fdr = np.mean(1 - incs[incs >= c])
+        # Inclusion prob threshold value. Direct posterior probability approach cf. Newton et al. (2004)
+        def opt_thresh(result, alpha):
+            incs = np.array(result.loc[result["inclusion_prob"] > 0, "inclusion_prob"])
+            incs[::-1].sort()
 
-                    if fdr < alpha:
-                        # ceiling with 3 decimals precision
-                        c = np.floor(c * 10**3) / 10**3
-                        return c, fdr
-                return 1.0, 0
+            for c in np.unique(incs):
+                fdr = np.mean(1 - incs[incs >= c])
 
-            threshold, fdr_ = opt_thresh(effect_df, target_fdr)
+                if fdr < alpha:
+                    # ceiling with 3 decimals precision
+                    c = np.floor(c * 10**3) / 10**3
+                    return c, fdr
+            return 1.0, 0
 
-            # Save cutoff inclusion probability to scCODA params in uns
-            sample_adata.uns["scCODA_params"]["threshold_prob"] = threshold
+        threshold, fdr_ = opt_thresh(effect_df, target_fdr)
 
-            # Decide whether betas are significant or not, set non-significant ones to 0
-            effect_df.loc[:, "final_parameter"] = np.where(
-                effect_df.loc[:, "inclusion_prob"] >= threshold, effect_df.loc[:, "mean_nonzero"], 0
-            )
+        # Save cutoff inclusion probability to scCODA params in uns
+        try:
+            sample_adata.uns["scCODA_params"]["threshold_prob"][mcmc_beta_key] = threshold
+        except KeyError:
+            sample_adata.uns["scCODA_params"]["threshold_prob"] = {}
+            sample_adata.uns["scCODA_params"]["threshold_prob"][mcmc_beta_key] = threshold
 
-        # tascCODA model (spike-and-slab LASSO + tree aggregation)
-        elif select_type == "sslasso" and model_type == "tree_agg":
-            # Get ancestor matrix
-            A = sample_adata.uns["scCODA_params"]["ancestor_matrix"]
-
-            # Feature-level effects are just node-level effects time ancestor matrix
-            effect_df["final_parameter"] = np.matmul(
-                np.kron(np.eye(D, dtype=int), A), np.array(node_df["final_parameter"])
-            )
-
-        # Get expected sample, log-fold change
-        y_bar = np.mean(np.sum(sample_adata.X, axis=1))
-        alpha_par = intercept_df.loc[:, "final_parameter"]
-        alphas_exp = np.exp(alpha_par)
-        alpha_sample = (alphas_exp / np.sum(alphas_exp) * y_bar).values
-
-        beta_mean = np.array(alpha_par)
-        for d in range(D):
-            beta_d = effect_df.loc[:, "final_parameter"].values[(d * K) : ((d + 1) * K)]
-            beta_d = beta_mean + beta_d
-            beta_d = np.exp(beta_d)
-            beta_d = beta_d / np.sum(beta_d) * y_bar
-            if d == 0:
-                beta_sample = beta_d
-                log_sample = np.log2(beta_d / alpha_sample)
-            else:
-                beta_sample = np.append(beta_sample, beta_d)
-                log_sample = np.append(log_sample, np.log2(beta_d / alpha_sample))
-        effect_df.loc[:, "expected_sample"] = beta_sample
-        effect_df.loc[:, "log_fold"] = log_sample
-
+        effect_df.loc[:, "final_parameter"] = effect_df.loc[:, "mean_nonzero"]
+        )
+        
         return effect_df
-
-    def __complete_node_df(
-        self,
-        sample_adata: AnnData,
-        node_df: pd.DataFrame,
-    ) -> pd.DataFrame:
-        """Evaluation of MCMC results for node-level effect parameters. This function is only used within self.summary_prepare.
-            This function determines whether node-level effects are credible or not
-
-        Args:
-            sample_adata: Anndata object with cell counts as sample_adata.X and covariates saved in sample_adata.obs.
-            node_df: Node-level effect summary, see ``summary_prepare``
-
-        Returns:
-            pd.DataFrame: node-level effect DataFrame with inclusion threshold, final parameters, significance indicator
-        """
-        # calculate inclusion threshold
-        theta = np.median(np.array(sample_adata.uns["scCODA_params"]["mcmc"]["samples"]["theta"]))
-        l_0 = sample_adata.uns["scCODA_params"]["sslasso_pen_args"]["lambda_0"]
-        l_1 = sample_adata.uns["scCODA_params"]["sslasso_pen_args"]["lambda_1_scaled"]
-
-        def delta(l_0, l_1, theta):
-            p_t = (theta * l_1 / 2) / ((theta * l_1 / 2) + ((1 - theta) * l_0 / 2))
-            return 1 / (l_0 - l_1) * np.log(1 / p_t - 1)
-
-        D = len(node_df.index.levels[0])
-
-        # apply inclusion threshold
-        deltas = delta(l_0, l_1, theta)
-        refs = np.sort(sample_adata.uns["scCODA_params"]["reference_index"])
-        deltas = np.insert(deltas, [refs[i] - i for i in range(len(refs))], 0)
-
-        node_df["delta"] = np.tile(deltas, D)
-        node_df["significant"] = np.abs(node_df["median"]) > node_df["delta"]
-        node_df["final_parameter"] = np.where(node_df.loc[:, "significant"], node_df.loc[:, "median"], 0)
-
-        return node_df
-
-    def __complete_alpha_df(self, sample_adata: AnnData, intercept_df: pd.DataFrame) -> pd.DataFrame:
-        """Evaluation of MCMC results for intercepts. This function is only used within self.summary_prepare.
-
-        Args:
-            sample_adata: Anndata object with cell counts as sample_adata.X and covariates saved in sample_adata.obs.
-            intercept_df: Intercept summary, see ``summary_prepare``
-
-        Returns:
-            pd.DataFrame: intercept DataFrame with expected sample, final parameters
-        """
-        intercept_df = intercept_df.rename(columns={"mean": "final_parameter"})
-
-        # Get expected sample
-        y_bar = np.mean(np.sum(sample_adata.X, axis=1))
-        alphas_exp = np.exp(intercept_df.loc[:, "final_parameter"])
-        alpha_sample = (alphas_exp / np.sum(alphas_exp) * y_bar).values
-        intercept_df.loc[:, "expected_sample"] = alpha_sample
-
-        return intercept_df
 
     def summary(self, data: AnnData | MuData, extended: bool = False, modality_key: str = "coda", *args, **kwargs):
         """Printing method for the summary.
@@ -823,26 +734,26 @@ class CompositionalModel2(ABC):
         # If other than default values for e.g. confidence interval are specified,
         # recalculate them for intercept and effect DataFrames
         if args or kwargs:
-            if model_type == "tree_agg":
-                intercept_df, effect_df, node_df = self.summary_prepare(sample_adata, *args, **kwargs)  # type: ignore
-            else:
-                intercept_df, effect_df = self.summary_prepare(sample_adata, *args, **kwargs)  # type: ignore
+            intercept_df, effect_df = self.summary_prepare(sample_adata, *args, **kwargs)  # type: ignore
         # otherwise, get pre-calculated DataFrames. Effect DataFrame is stitched together from varm
         else:
             intercept_df = sample_adata.varm["intercept_df"]
             covariates = sample_adata.uns["scCODA_params"]["covariate_names"]
-            effect_dfs = [sample_adata.varm[f"effect_df_{cov}"] for cov in covariates]
+            region_names = ["Global"]
+            region_names.extend(sample_adata.uns["scCODA_params"]["region_names"])
+            effect_dfs = []
+            for region in region_names:
+                for cov in covariates:
+                    effect_dfs.append(sample_adata.varm[f"effect_df_{region}_{cov}"])
             effect_df = pd.concat(effect_dfs)
             effect_df.index = pd.MultiIndex.from_product(
-                (covariates, sample_adata.var.index.tolist()), names=["Covariate", "Cell Type"]
+                (region_names, covariates, sample_adata.var.index.tolist()), names=["Region", "Covariate", "Cell Type"]
             )
             effect_df.index = effect_df.index.set_levels(
-                effect_df.index.levels[0].str.replace("Condition", "").str.replace("[", "").str.replace("]", ""),
-                level=0,
+                effect_df.index.levels[1].str.replace("Condition", "").str.replace("[", "").str.replace("]", ""),
+                level=1,
             )
-            if model_type == "tree_agg":
-                node_df = sample_adata.uns["scCODA_params"]["node_df"]
-
+            
         # Get number of samples, cell types
         data_dims = sample_adata.X.shape
 
@@ -850,7 +761,7 @@ class CompositionalModel2(ABC):
         table = Table(title="Compositional Analysis summary", box=box.SQUARE, expand=True, highlight=True)
         table.add_column("Name", justify="left", style="cyan")
         table.add_column("Value", justify="left")
-        table.add_row("Data", f"Data: {data_dims[0]} samples, {data_dims[1]} cell types")
+        table.add_row("Data", "Data: %d samples, %d cell types" % data_dims)
         table.add_row("Reference cell type", "{}".format(str(sample_adata.uns["scCODA_params"]["reference_cell_type"])))
         table.add_row("Formula", "{}".format(sample_adata.uns["scCODA_params"]["formula"]))
         if extended:
@@ -875,22 +786,13 @@ class CompositionalModel2(ABC):
             )
         console.print(table)
 
-        intercept_df_basic = intercept_df.loc[:, intercept_df.columns.isin(["Final Parameter", "Expected Sample"])]
-        if model_type == "tree_agg":
-            node_df_basic = node_df.loc[:, node_df.columns.isin(["Final Parameter", "Is credible"])]
-            effect_df_basic = effect_df.loc[
-                :, effect_df.columns.isin(["Effect", "Expected Sample", "log2-fold change"])
-            ]
-            effect_df_extended = effect_df.loc[
-                :, ~effect_df.columns.isin(["Effect", "Expected Sample", "log2-fold change"])
-            ]
-        else:
-            effect_df_basic = effect_df.loc[
-                :, effect_df.columns.isin(["Final Parameter", "Expected Sample", "log2-fold change"])
-            ]
-            effect_df_extended = effect_df.loc[
-                :, ~effect_df.columns.isin(["Final Parameter", "Expected Sample", "log2-fold change"])
-            ]
+        intercept_df_basic = intercept_df.loc[:, intercept_df.columns.isin(["Final Parameter"])]
+        effect_df_basic = effect_df.loc[
+            :, effect_df.columns.isin(["Final Parameter"])
+        ]
+        effect_df_extended = effect_df.loc[
+            :, ~effect_df.columns.isin(["Final Parameter"])
+        ]
         if extended:
             table = Table("Intercepts", box=box.SQUARE, expand=True, highlight=True)
             table.add_row(intercept_df.to_string(justify="center", float_format=lambda _: f"{_:.3f}"))
@@ -904,15 +806,6 @@ class CompositionalModel2(ABC):
             table.add_row(effect_df_extended.to_string(justify="center", float_format=lambda _: f"{_:.3f}"))
             console.print(table)
 
-            if model_type == "tree_agg":
-                table = Table("Nodes", box=box.SQUARE, expand=True, highlight=True)
-                for index in node_df.index.levels[0]:
-                    table.add_row(f"Covariate={index}", end_section=True)
-                    table.add_row(
-                        node_df.loc[index].to_string(justify="center", float_format=lambda _: f"{_:.2f}"),
-                        end_section=True,
-                    )
-                console.print(table)
         else:
             table = Table("Intercepts", box=box.SQUARE, expand=True, highlight=True)
             table.add_row(intercept_df_basic.to_string(justify="center", float_format=lambda _: f"{_:.3f}"))
@@ -921,16 +814,6 @@ class CompositionalModel2(ABC):
             table = Table("Effects", box=box.SQUARE, expand=True, highlight=True)
             table.add_row(effect_df_basic.to_string(justify="center", float_format=lambda _: f"{_:.3f}"))
             console.print(table)
-
-            if model_type == "tree_agg":
-                table = Table("Nodes", box=box.SQUARE, expand=True, highlight=True)
-                for index in node_df_basic.index.levels[0]:
-                    table.add_row(f"Covariate={index}", end_section=True)
-                    table.add_row(
-                        node_df_basic.loc[index].to_string(justify="center", float_format=lambda _: f"{_:.2f}"),
-                        end_section=True,
-                    )
-                console.print(table)
 
     def get_intercept_df(self, data: AnnData | MuData, modality_key: str = "coda"):
         """Get intercept dataframe as printed in the extended summary
@@ -993,54 +876,22 @@ class CompositionalModel2(ABC):
             sample_adata = data
 
         covariates = sample_adata.uns["scCODA_params"]["covariate_names"]
-        effect_dfs = [sample_adata.varm[f"effect_df_{cov}"] for cov in covariates]
+        region_names = ["Global"]
+        region_names.extend(sample_adata.uns["scCODA_params"]["region_names"])
+        effect_dfs = []
+        for region in region_names:
+            for cov in covariates:
+                effect_dfs.append(sample_adata.varm[f"effect_df_{region}_{cov}"])
         effect_df = pd.concat(effect_dfs)
         effect_df.index = pd.MultiIndex.from_product(
-            (covariates, sample_adata.var.index.tolist()), names=["Covariate", "Cell Type"]
+            (covariates, sample_adata.var.index.tolist()), names=["Region", "Covariate", "Cell Type"]
         )
         effect_df.index = effect_df.index.set_levels(
-            effect_df.index.levels[0].str.replace("Condition", "").str.replace("[", "").str.replace("]", ""),
+            effect_df.index.levels[1].str.replace("Condition", "").str.replace("[", "").str.replace("]", ""),
             level=0,
         )
 
         return effect_df
-
-    def get_node_df(self, data: AnnData | MuData, modality_key: str = "coda"):
-        """Get node effect dataframe as printed in the extended summary of a tascCODA model
-
-        Args:
-            data: AnnData object or MuData object.
-            modality_key: If data is a MuData object, specify which modality to use.
-
-        Returns:
-            pd.DataFrame: Node effect data frame.
-
-        Examples:
-            >>> import pertpy as pt
-            >>> adata = pt.dt.tasccoda_example()
-            >>> tasccoda = pt.tl.Tasccoda()
-            >>> mdata = tasccoda.load(
-            >>>     adata, type="sample_level",
-            >>>     levels_agg=["Major_l1", "Major_l2", "Major_l3", "Major_l4", "Cluster"],
-            >>>     key_added="lineage", add_level_name=True
-            >>> )
-            >>> mdata = tasccoda.prepare(
-            >>>     mdata, formula="Health", reference_cell_type="automatic", tree_key="lineage", pen_args={"phi" : 0}
-            >>> )
-            >>> tasccoda.run_nuts(mdata, num_samples=1000, num_warmup=100, rng_key=42)
-            >>> node_effects = tasccoda.get_node_df(mdata)
-        """
-
-        if isinstance(data, MuData):
-            try:
-                sample_adata = data[modality_key]
-            except IndexError:
-                logger.error("When data is a MuData object, modality_key must be specified!")
-                raise
-        if isinstance(data, AnnData):
-            sample_adata = data
-
-        return sample_adata.uns["scCODA_params"]["node_df"]
 
     def set_fdr(self, data: AnnData | MuData, est_fdr: float, modality_key: str = "coda", *args, **kwargs):
         """Direct posterior probability approach to calculate credible effects while keeping the expected FDR at a certain level
@@ -1067,15 +918,15 @@ class CompositionalModel2(ABC):
 
         if sample_adata.uns["scCODA_params"]["model_type"] == "classic":
             intercept_df, effect_df = self.summary_prepare(sample_adata, est_fdr, *args, **kwargs)  # type: ignore
-        elif sample_adata.uns["scCODA_params"]["model_type"] == "tree_agg":
-            intercept_df, effect_df, node_df = self.summary_prepare(sample_adata, est_fdr, *args, **kwargs)  # type: ignore
-            sample_adata.uns["scCODA_params"]["node_df"] = node_df
         else:
             raise ValueError("No valid model type!")
 
-        sample_adata.varm["intercept_df"] = intercept_df
-        for cov in effect_df.index.get_level_values("Covariate"):
-            sample_adata.varm[f"effect_df_{cov}"] = effect_df.loc[cov, :]
+        for region in intercept_df.index.get_level_values("Region").unique():
+            sample_adata.varm[f"intercept_df_{region}"] = intercept_df.loc[region, :]
+        
+        for region in effect_df.index.get_level_values("Region").unique():
+            for cov in effect_df.index.get_level_values("Covariate").unique():
+                sample_adata.varm[f"effect_df_{region}_{cov}"] = effect_df.loc[(region, cov), :]
 
     def credible_effects(self, data: AnnData | MuData, modality_key: str = "coda", est_fdr: float = None) -> pd.Series:
         """Decides which effects of the scCODA model are credible based on an adjustable inclusion probability threshold.
@@ -1110,15 +961,17 @@ class CompositionalModel2(ABC):
                 _, eff_df = self.summary_prepare(sample_adata, est_fdr=est_fdr)  # type: ignore
         # otherwise, get pre-calculated DataFrames. Effect DataFrame is stitched together from varm
         else:
-            if model_type == "tree_agg" and select_type == "sslasso":
-                eff_df = sample_adata.uns["scCODA_params"]["node_df"]
-            else:
-                covariates = sample_adata.uns["scCODA_params"]["covariate_names"]
-                effect_dfs = [sample_adata.varm[f"effect_df_{cov}"] for cov in covariates]
-                eff_df = pd.concat(effect_dfs)
-                eff_df.index = pd.MultiIndex.from_product(
-                    (covariates, sample_adata.var.index.tolist()), names=["Covariate", "Cell Type"]
-                )
+            covariates = sample_adata.uns["scCODA_params"]["covariate_names"]
+            region_names = ["Global"]
+            region_names.extend(sample_adata.uns["scCODA_params"]["region_names"])
+            effect_dfs = []
+            for region in region_names:
+                for cov in covariates:
+                    effect_dfs.append(sample_adata.varm[f"effect_df_{region}_{cov}"])
+            effect_df = pd.concat(effect_dfs)
+            effect_df.index = pd.MultiIndex.from_product(
+                (covariates, sample_adata.var.index.tolist()), names=["Region", "Covariate", "Cell Type"]
+            )
 
         out = eff_df["Final Parameter"] != 0
         out.rename("credible change")
@@ -1291,7 +1144,7 @@ class CompositionalModel2(ABC):
         *,
         modality_key: str = "coda",
         covariates: str | list | None = None,
-        parameter: Literal["log2-fold change", "Final Parameter", "Expected Sample"] = "log2-fold change",
+        parameter: Literal["Final Parameter"] = "Final Parameter",
         plot_facets: bool = True,
         plot_zero_covariate: bool = True,
         plot_zero_cell_type: bool = False,
@@ -1824,283 +1677,6 @@ class CompositionalModel2(ABC):
             plt.show()
         if return_fig:
             return plt.gcf()
-        return None
-
-    @_doc_params(common_plot_args=doc_common_plot_args)
-    def plot_draw_tree(  # pragma: no cover
-        self,
-        data: AnnData | MuData,
-        *,
-        modality_key: str = "coda",
-        tree: str = "tree",  # Also type ete3.Tree. Omitted due to import errors
-        tight_text: bool | None = False,
-        show_scale: bool | None = False,
-        units: Literal["px", "mm", "in"] | None = "px",
-        figsize: tuple[float, float] | None = (None, None),
-        dpi: int | None = 100,
-        save: str | bool = False,
-        show: bool = True,
-        return_fig: bool = False,
-    ) -> Tree | None:
-        """Plot a tree using input ete3 tree object.
-
-        Args:
-            data: AnnData object or MuData object.
-            modality_key: If data is a MuData object, specify which modality to use.
-            tree: A ete3 tree object or a str to indicate the tree stored in `.uns`.
-            tight_text: When False, boundaries of the text are approximated according to general font metrics,
-                        producing slightly worse aligned text faces but improving the performance of tree visualization in scenes with a lot of text faces.
-            show_scale: Include the scale legend in the tree image or not.
-            units: Unit of image sizes. “px”: pixels, “mm”: millimeters, “in”: inches.
-            figsize: Figure size.
-            dpi: Dots per inches.
-            save: Save the tree plot to a file. You can specify the file name here.
-            {common_plot_args}
-
-        Returns:
-            Depending on `show`, returns :class:`ete3.TreeNode` and :class:`ete3.TreeStyle` (`show = False`) or plot the tree inline (`show = False`)
-
-        Examples:
-            >>> import pertpy as pt
-            >>> adata = pt.dt.tasccoda_example()
-            >>> tasccoda = pt.tl.Tasccoda()
-            >>> mdata = tasccoda.load(
-            >>>     adata, type="sample_level",
-            >>>     levels_agg=["Major_l1", "Major_l2", "Major_l3", "Major_l4", "Cluster"],
-            >>>     key_added="lineage", add_level_name=True
-            >>> )
-            >>> mdata = tasccoda.prepare(
-            >>>     mdata, formula="Health", reference_cell_type="automatic", tree_key="lineage", pen_args=dict(phi=0)
-            >>> )
-            >>> tasccoda.run_nuts(mdata, num_samples=1000, num_warmup=100, rng_key=42)
-            >>> tasccoda.plot_draw_tree(mdata, tree="lineage")
-
-        Preview:
-            .. image:: /_static/docstring_previews/tasccoda_draw_tree.png
-        """
-        try:
-            from ete3 import CircleFace, NodeStyle, TextFace, Tree, TreeStyle, faces
-        except ImportError:
-            raise ImportError(
-                "To use tasccoda please install additional dependencies with `pip install pertpy[coda]`"
-            ) from None
-
-        if isinstance(data, MuData):
-            data = data[modality_key]
-        if isinstance(data, AnnData):
-            data = data
-        if isinstance(tree, str):
-            tree = data.uns[tree]
-
-        def my_layout(node):
-            text_face = TextFace(node.name, tight_text=tight_text)
-            faces.add_face_to_node(text_face, node, column=0, position="branch-right")
-
-        tree_style = TreeStyle()
-        tree_style.show_leaf_name = False
-        tree_style.layout_fn = my_layout
-        tree_style.show_scale = show_scale
-
-        if save is not None:
-            tree.render(save, tree_style=tree_style, units=units, w=figsize[0], h=figsize[1], dpi=dpi)  # type: ignore
-        if show:
-            return tree.render("%%inline", tree_style=tree_style, units=units, w=figsize[0], h=figsize[1], dpi=dpi)  # type: ignore
-        if return_fig:
-            return tree, tree_style
-        return None
-
-    @_doc_params(common_plot_args=doc_common_plot_args)
-    def plot_draw_effects(  # pragma: no cover
-        self,
-        data: AnnData | MuData,
-        covariate: str,
-        *,
-        modality_key: str = "coda",
-        tree: str = "tree",  # Also type ete3.Tree. Omitted due to import errors
-        show_legend: bool | None = None,
-        show_leaf_effects: bool | None = False,
-        tight_text: bool | None = False,
-        show_scale: bool | None = False,
-        units: Literal["px", "mm", "in"] | None = "px",
-        figsize: tuple[float, float] | None = (None, None),
-        dpi: int | None = 100,
-        save: str | bool = False,
-        show: bool = True,
-        return_fig: bool = False,
-    ) -> Tree | None:
-        """Plot a tree with colored circles on the nodes indicating significant effects with bar plots which indicate leave-level significant effects.
-
-        Args:
-            data: AnnData object or MuData object.
-            covariate: The covariate, whose effects should be plotted.
-            modality_key: If data is a MuData object, specify which modality to use.
-            tree: A ete3 tree object or a str to indicate the tree stored in `.uns`.
-            show_legend: If show legend of nodes significant effects or not.
-                         Defaults to False if show_leaf_effects is True.
-            show_leaf_effects: If True, plot bar plots which indicate leave-level significant effects.
-            tight_text: When False, boundaries of the text are approximated according to general font metrics,
-                        producing slightly worse aligned text faces but improving the performance of tree visualization in scenes with a lot of text faces.
-            show_scale: Include the scale legend in the tree image or not.
-            units: Unit of image sizes. “px”: pixels, “mm”: millimeters, “in”: inches.
-            figsize: Figure size.
-            dpi: Dots per inches.
-            save: Save the tree plot to a file. You can specify the file name here.
-            {common_plot_args}
-
-        Returns:
-            Returns :class:`ete3.TreeNode` and :class:`ete3.TreeStyle` (`return_fig = False`)
-            or plot the tree inline (`show = True`)
-
-        Examples:
-            >>> import pertpy as pt
-            >>> adata = pt.dt.tasccoda_example()
-            >>> tasccoda = pt.tl.Tasccoda()
-            >>> mdata = tasccoda.load(
-            >>>     adata, type="sample_level",
-            >>>     levels_agg=["Major_l1", "Major_l2", "Major_l3", "Major_l4", "Cluster"],
-            >>>     key_added="lineage", add_level_name=True
-            >>> )
-            >>> mdata = tasccoda.prepare(
-            >>>     mdata, formula="Health", reference_cell_type="automatic", tree_key="lineage", pen_args=dict(phi=0)
-            >>> )
-            >>> tasccoda.run_nuts(mdata, num_samples=1000, num_warmup=100, rng_key=42)
-            >>> tasccoda.plot_draw_effects(mdata, covariate="Health[T.Inflamed]", tree="lineage")
-
-        Preview:
-            .. image:: /_static/docstring_previews/tasccoda_draw_effects.png
-        """
-        try:
-            from ete3 import CircleFace, NodeStyle, TextFace, Tree, TreeStyle, faces
-        except ImportError:
-            raise ImportError(
-                "To use tasccoda please install additional dependencies as `pip install pertpy[coda]`"
-            ) from None
-
-        if isinstance(data, MuData):
-            data = data[modality_key]
-        if isinstance(data, AnnData):
-            data = data
-        if show_legend is None:
-            show_legend = not show_leaf_effects
-        elif show_legend:
-            logger.info("Tree leaves and leaf effect bars won't be aligned when legend is shown!")
-
-        if isinstance(tree, str):
-            tree = data.uns[tree]
-        # Collapse tree singularities
-        tree2 = collapse_singularities_2(tree)
-
-        node_effs = data.uns["scCODA_params"]["node_df"].loc[(covariate + "_node",),].copy()
-        node_effs.index = node_effs.index.get_level_values("Node")
-
-        covariates = data.uns["scCODA_params"]["covariate_names"]
-        effect_dfs = [data.varm[f"effect_df_{cov}"] for cov in covariates]
-        eff_df = pd.concat(effect_dfs)
-        eff_df.index = pd.MultiIndex.from_product(
-            (covariates, data.var.index.tolist()),
-            names=["Covariate", "Cell Type"],
-        )
-        leaf_effs = eff_df.loc[(covariate,),].copy()
-        leaf_effs.index = leaf_effs.index.get_level_values("Cell Type")
-
-        # Add effect values
-        for n in tree2.traverse():
-            nstyle = NodeStyle()
-            nstyle["size"] = 0
-            n.set_style(nstyle)
-            if n.name in node_effs.index:
-                e = node_effs.loc[n.name, "Final Parameter"]
-                n.add_feature("node_effect", e)
-            else:
-                n.add_feature("node_effect", 0)
-            if n.name in leaf_effs.index:
-                e = leaf_effs.loc[n.name, "Effect"]
-                n.add_feature("leaf_effect", e)
-            else:
-                n.add_feature("leaf_effect", 0)
-
-        # Scale effect values to get nice node sizes
-        eff_max = np.max([np.abs(n.node_effect) for n in tree2.traverse()])
-        leaf_eff_max = np.max([np.abs(n.leaf_effect) for n in tree2.traverse()])
-
-        def my_layout(node):
-            text_face = TextFace(node.name, tight_text=tight_text)
-            text_face.margin_left = 10
-            faces.add_face_to_node(text_face, node, column=0, aligned=True)
-
-            # if node.is_leaf():
-            size = (np.abs(node.node_effect) * 10 / eff_max) if node.node_effect != 0 else 0
-            if np.sign(node.node_effect) == 1:
-                color = "blue"
-            elif np.sign(node.node_effect) == -1:
-                color = "red"
-            else:
-                color = "cyan"
-            if size != 0:
-                faces.add_face_to_node(CircleFace(radius=size, color=color), node, column=0)
-
-        tree_style = TreeStyle()
-        tree_style.show_leaf_name = False
-        tree_style.layout_fn = my_layout
-        tree_style.show_scale = show_scale
-        tree_style.draw_guiding_lines = True
-        tree_style.legend_position = 1
-
-        if show_legend:
-            tree_style.legend.add_face(TextFace("Effects"), column=0)
-            tree_style.legend.add_face(TextFace("       "), column=1)
-            for i in range(4, 0, -1):
-                tree_style.legend.add_face(
-                    CircleFace(
-                        float(f"{np.abs(eff_max) * 10 * i / (eff_max * 4):.2f}"),
-                        "red",
-                    ),
-                    column=0,
-                )
-                tree_style.legend.add_face(TextFace(f"{-eff_max * i / 4:.2f} "), column=0)
-                tree_style.legend.add_face(
-                    CircleFace(
-                        float(f"{np.abs(eff_max) * 10 * i / (eff_max * 4):.2f}"),
-                        "blue",
-                    ),
-                    column=1,
-                )
-                tree_style.legend.add_face(TextFace(f" {eff_max * i / 4:.2f}"), column=1)
-
-        if show_leaf_effects:
-            leaf_name = [node.name for node in tree2.traverse("postorder") if node.is_leaf()]
-            leaf_effs = leaf_effs.loc[leaf_name].reset_index()
-            palette = ["blue" if Effect > 0 else "red" for Effect in leaf_effs["Effect"].tolist()]
-
-            dir_path = Path.cwd()
-            dir_path = Path(dir_path / "tree_effect.png")
-            tree2.render(dir_path, tree_style=tree_style, units="in")
-            _, ax = plt.subplots(1, 2, figsize=(10, 10))
-            sns.barplot(data=leaf_effs, x="Effect", y="Cell Type", palette=palette, ax=ax[1])
-            img = mpimg.imread(dir_path)
-            ax[0].imshow(img)
-            ax[0].get_xaxis().set_visible(False)
-            ax[0].get_yaxis().set_visible(False)
-            ax[0].set_frame_on(False)
-
-            ax[1].get_yaxis().set_visible(False)
-            ax[1].spines["left"].set_visible(False)
-            ax[1].spines["right"].set_visible(False)
-            ax[1].spines["top"].set_visible(False)
-            plt.xlim(-leaf_eff_max, leaf_eff_max)
-            plt.subplots_adjust(wspace=0)
-
-            if save:
-                plt.savefig(save)
-
-        if save and not show_leaf_effects:
-            tree2.render(save, tree_style=tree_style, units=units)
-        if show:
-            if not show_leaf_effects:
-                return tree2.render("%%inline", tree_style=tree_style, units=units, w=figsize[0], h=figsize[1], dpi=dpi)
-        if return_fig:
-            if not show_leaf_effects:
-                return tree2, tree_style
         return None
 
     @_doc_params(common_plot_args=doc_common_plot_args)

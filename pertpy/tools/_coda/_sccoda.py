@@ -7,8 +7,9 @@ import jax.numpy as jnp
 import numpy as np
 import numpyro as npy
 import numpyro.distributions as npd
+import pandas as pd
 from anndata import AnnData
-from jax import config, random
+from jax import config, random, nn
 from lamin_utils import logger
 from mudata import MuData
 from numpyro.infer import Predictive
@@ -20,7 +21,6 @@ if TYPE_CHECKING:
     import pandas as pd
 
 config.update("jax_enable_x64", True)
-
 
 class Sccoda(CompositionalModel2):
     """
@@ -116,6 +116,8 @@ class Sccoda(CompositionalModel2):
         self,
         data: AnnData | MuData,
         formula: str,
+        region_key: str,  # Add region labels for regions
+        cell_type_region_mask: [np.ndarray | None] = None,  # Mask for cell types presence in regions
         reference_cell_type: str = "automatic",
         automatic_reference_absence_threshold: float = 0.05,
         modality_key: str = "coda",
@@ -160,18 +162,46 @@ class Sccoda(CompositionalModel2):
         if isinstance(data, AnnData):
             adata = data
             is_MuData = False
+
+        # Extract and encode region labels
+        if region_key not in adata.obs:
+            raise ValueError(f"Column '{region_key}' not found in adata.obs")
+        
+        # One-hot encode
+        region_labels_onehot = pd.get_dummies(adata.obs[region_key])
+        region_names = region_labels_onehot.columns.to_list()
+        region_labels_onehot = region_labels_onehot.to_numpy()
+        num_regions = region_labels_onehot.shape[1]
+        adata.obsm["region_labels"] = region_labels_onehot
+
+        # Mask cell types
+        if not cell_type_region_mask:
+            cell_type_region_mask = pd.DataFrame(0, index=adata.obs[region_key].cat.categories, columns=adata.var_names)
+            for i in adata.obs[region_key].cat.categories:
+                cell_type_region_mask.loc[i, :] = adata[adata.obs[region_key] == i, :].X.sum(axis=0) > 0
+            cell_type_region_mask = cell_type_region_mask.to_numpy().astype(int)
+            cell_type_region_mask = np.matmul(region_labels_onehot, cell_type_region_mask)
+        
+        adata.obsm["cell_type_region_mask"] = cell_type_region_mask
+
         adata = super().prepare(adata, formula, reference_cell_type, automatic_reference_absence_threshold)
+
+        adata.uns["scCODA_params"]["region_names"] = region_names
+        
         # All parameters that are returned for analysis
         adata.uns["scCODA_params"]["param_names"] = [
-            "sigma_d",
-            "b_offset",
-            "ind_raw",
+            "shared_coeffs",
+            "region_coeffs",
+            "sigma_d_shared",
+            "b_offset_shared",
+            "ind_raw_shared",
+            "sigma_d_region",
+            "b_offset_region",
+            "ind_raw_region",
             "alpha",
-            "ind",
-            "b_raw",
             "beta",
-            "concentration",
-            "prediction",
+            "concentrations",
+            "counts",
         ]
 
         adata.uns["scCODA_params"]["model_type"] = "classic"
@@ -211,31 +241,33 @@ class Sccoda(CompositionalModel2):
         # data dimensions
         N, D = sample_adata.obsm["covariate_matrix"].shape
         P = sample_adata.X.shape[1]
-
-        # Sizes of different parameter matrices
-        alpha_size = [P]
-        sigma_size = [D, 1]
-        beta_nobl_size = [D, P - 1]
+        R = sample_adata.obsm["region_labels"].shape[1]
 
         # Initial MCMC states
         rng = np.random.default_rng(seed=rng_key)
 
         sample_adata.uns["scCODA_params"]["mcmc"]["init_params"] = {
-            "sigma_d": np.ones(dtype=np.float64, shape=sigma_size),
-            "b_offset": rng.normal(0.0, 1.0, beta_nobl_size),
-            "ind_raw": np.zeros(dtype=np.float64, shape=beta_nobl_size),
-            "alpha": rng.normal(0.0, 1.0, alpha_size),
+            "shared_coeffs": rng.normal(0.0, 1.0, (D, P - 1)),
+            "region_coeffs": rng.normal(0.0, 1.0, (R, D, P - 1)),
+            "sigma_d_shared": rng.uniform(0.5, 1.0, (D, 1)),
+            "b_offset_shared": rng.normal(0.0, 1.0, (D, P - 1)),
+            "ind_raw_shared": rng.normal(0.0, 1.0, (D, P - 1)),
+            "sigma_d_region": rng.uniform(0.5, 1.0, (R, D, 1)),
+            "b_offset_region": rng.normal(0.0, 1.0, (R, D, P - 1)),
+            "ind_raw_region": rng.normal(0.0, 1.0, (R, D, P - 1)),
+            "alpha_per_region": rng.normal(0.0, 1.0, (R, P))
         }
 
         return sample_adata
-
-    def model(  # type: ignore
+    
+    def model(
         self,
         counts: np.ndarray,
         covariates: np.ndarray,
         n_total: np.ndarray,
         ref_index,
-        sample_adata: AnnData,
+        region_labels_onehot: np.ndarray,  # One-hot encoded region identifiers
+        cell_type_region_mask: np.ndarray,  # Cell type presence mask per region
     ):
         """
         Implements scCODA model in numpyro
@@ -250,52 +282,93 @@ class Sccoda(CompositionalModel2):
         Returns:
             predictions (see numpyro documentation for details on models)
         """
-        # data dimensions
-        N, D = sample_adata.obsm["covariate_matrix"].shape
-        P = sample_adata.X.shape[1]
 
-        # numpyro plates for all dimensions
-        covariate_axis = npy.plate("covs", D, dim=-2)
-        cell_type_axis = npy.plate("ct", P, dim=-1)
-        cell_type_axis_nobl = npy.plate("ctnb", P - 1, dim=-1)
-        sample_axis = npy.plate("sample", N, dim=-2)
+        # Data Dimensions
+        N, D = covariates.shape  # Samples x Covariates
+        P = counts.shape[1]  # Cell types
+        R = region_labels_onehot.shape[1]
 
-        # Effect priors
-        with covariate_axis:
-            sigma_d = npy.sample("sigma_d", npd.HalfCauchy(1.0))
-
-        with covariate_axis, cell_type_axis_nobl:
-            b_offset = npy.sample("b_offset", npd.Normal(0.0, 1.0))
-
-            # spike-and-slab
-            ind_raw = npy.sample("ind_raw", npd.Normal(0.0, 1.0))
-            ind_scaled = ind_raw * 50
-            ind = npy.deterministic("ind", jnp.exp(ind_scaled) / (1 + jnp.exp(ind_scaled)))
-
-            b_raw = sigma_d * b_offset
-
-            beta_raw = npy.deterministic("b_raw", ind * b_raw)
-
-        with cell_type_axis:
-            # Intercepts
-            alpha = npy.sample("alpha", npd.Normal(0.0, 5.0))
-
-            # Add 0 effect reference feature
-            with covariate_axis:
-                beta_full = jnp.concatenate(
-                    (beta_raw[:, :ref_index], jnp.zeros(shape=[D, 1]), beta_raw[:, ref_index:]), axis=-1
-                )
-                beta = npy.deterministic("beta", beta_full)
-
-        # Combine intercepts and effects
-        with sample_axis:
-            concentrations = npy.deterministic(
-                "concentrations", jnp.nan_to_num(jnp.exp(alpha + jnp.matmul(covariates, beta)), 0.0001)
+        cell_type_region_presence = jnp.matmul(region_labels_onehot.T, cell_type_region_mask)  # Shape: (R, P)
+        multi_region_cell_types = ((cell_type_region_presence > 0).sum(axis=0) > 1).astype(jnp.float32)  # Shape: (P,)
+        
+        # Plates
+        sample_plate = npy.plate("samples", N, dim=-2)
+        region_plate = npy.plate("regions", R, dim=-3)
+        covariate_plate = npy.plate("covariates", D, dim=-2)
+        cell_type_plate = npy.plate("cell_types", P, dim=-1)
+        nonref_cell_plate = npy.plate("nonref_cells", P - 1, dim=-1)
+        
+        # Effect priors for shared coefficients
+        with covariate_plate:
+            sigma_d_shared = npy.sample("sigma_d_shared", npd.HalfCauchy(1.0))
+        
+        with covariate_plate, nonref_cell_plate:
+            b_offset_shared = npy.sample("b_offset_shared", npd.Normal(0.0, 1.0))
+            ind_raw_shared = npy.sample("ind_raw_shared", npd.Normal(0.0, 1.0))
+            ind_scaled_shared = ind_raw_shared * 50
+            ind_shared = npy.deterministic("ind_shared", jnp.exp(ind_scaled_shared) / (1 + jnp.exp(ind_scaled_shared)))
+        
+            b_raw_shared = sigma_d_shared * b_offset_shared
+            shared_coeffs = ind_shared * b_raw_shared
+        
+        # Effect priors for region-specific coefficients
+        with region_plate, covariate_plate:
+            sigma_d_region = npy.sample("sigma_d_region", npd.HalfCauchy(1.0))
+        
+        with region_plate, covariate_plate, nonref_cell_plate:
+            b_offset_region = npy.sample("b_offset_region", npd.Normal(0.0, 1.0))
+            ind_raw_region = npy.sample("ind_raw_region", npd.Normal(0.0, 1.0))
+            ind_scaled_region = ind_raw_region * 50
+            ind_region = npy.deterministic("ind_region", jnp.exp(ind_scaled_region) / (1 + jnp.exp(ind_scaled_region)))
+        
+            b_raw_region = sigma_d_region * b_offset_region
+            region_coeffs = ind_region * b_raw_region
+                
+        # Combine coefficients with zero effect for the reference feature and masked absent cell types
+        with covariate_plate, cell_type_plate:
+            beta_full = jnp.concatenate(
+                [
+                    shared_coeffs[..., :ref_index],
+                    jnp.zeros([D, 1]), # Zero effect for reference cell type
+                    shared_coeffs[..., ref_index:]
+                ],
+                axis=-1
             )
+            beta_full = npy.deterministic("beta_full", beta_full)
+            
+            beta_full = jnp.expand_dims(beta_full, axis=0)
+            beta_full = beta_full * jnp.expand_dims(cell_type_region_mask, axis=1)
+            beta_full = beta_full * jnp.expand_dims(multi_region_cell_types, axis=(0, 1))
 
+        
+        with region_plate, covariate_plate, cell_type_plate:
+            beta_region_specific = jnp.concatenate(
+                [
+                    region_coeffs[..., :ref_index],
+                    jnp.zeros([R, D, 1]), # Zero effect for reference cell type
+                    region_coeffs[..., ref_index:]
+                ],
+                axis=-1
+            )
+            beta_region_specific = npy.deterministic("beta_region_specific", beta_region_specific)
+            beta_region_specific = jnp.tensordot(region_labels_onehot, beta_region_specific, axes=(1, 0))
+
+
+
+        # Intercept per region and cell type
+        with region_plate, cell_type_plate:
+            alpha_per_region = npy.sample("alpha_per_region", npd.Normal(0.0, 5.0))
+        
+        # Combine intercepts and effects
+        with sample_plate:
+            alpha_per_sample = jnp.tensordot(region_labels_onehot, alpha_per_region, axes=(1, 0))
+            concentrations = npy.deterministic(
+                "concentrations", jnp.nan_to_num(jnp.exp(alpha_per_sample + jnp.einsum("nd,ndp->np", covariates, beta_full + beta_region_specific)), 0.0001)
+            )
+        
         # Calculate DM-distributed counts
         predictions = npy.sample("counts", npd.DirichletMultinomial(concentrations, n_total), obs=counts)
-
+        
         return predictions
 
     def make_arviz(  # type: ignore
@@ -343,27 +416,30 @@ class Sccoda(CompositionalModel2):
         if not self.mcmc:
             raise ValueError("No MCMC sampling found. Please run a sampler first!")
 
-        # feature names
+        # Feature names
         cell_types = sample_adata.var.index.to_list()
+        reference_index = sample_adata.uns["scCODA_params"]["reference_index"]
+        cell_types_nb = cell_types[:reference_index] + cell_types[reference_index + 1 :]
 
         # arviz dimensions
         dims = {
-            "alpha": ["cell_type"],
-            "sigma_d": ["covariate", "0"],
-            "b_offset": ["covariate", "cell_type_nb"],
-            "ind_raw": ["covariate", "cell_type_nb"],
-            "ind": ["covariate", "cell_type_nb"],
-            "b_raw": ["covariate", "cell_type_nb"],
-            "beta": ["covariate", "cell_type"],
+            "alpha_per_region": ["region", "cell_type"],
+            "sigma_d_shared": ["covariate", "0"],
+            "b_offset_shared": ["covariate", "cell_type_nb"],
+            "ind_raw_shared": ["covariate", "cell_type_nb"],
+            "beta_full": ["covariate", "cell_type"],
+            "sigma_d_region": ["region", "covariate", "0"],
+            "b_offset_region": ["region", "covariate", "cell_type_nb"],
+            "ind_raw_region": ["region", "covariate", "cell_type_nb"],
+            "beta_region_specific": ["region", "covariate", "cell_type"],
             "concentrations": ["sample", "cell_type"],
             "predictions": ["sample", "cell_type"],
             "counts": ["sample", "cell_type"],
         }
 
-        # arviz coordinates
-        reference_index = sample_adata.uns["scCODA_params"]["reference_index"]
-        cell_types_nb = cell_types[:reference_index] + cell_types[reference_index + 1 :]
+        # ArviZ coordinates
         coords = {
+            "region": sample_adata.uns["scCODA_params"]["region_names"],
             "cell_type": cell_types,
             "cell_type_nb": cell_types_nb,
             "covariate": sample_adata.uns["scCODA_params"]["covariate_names"],
@@ -376,11 +452,15 @@ class Sccoda(CompositionalModel2):
         numpyro_covariates = jnp.array(sample_adata.obsm["covariate_matrix"], dtype=dtype)
         numpyro_n_total = jnp.array(sample_adata.obsm["sample_counts"], dtype=dtype)
         ref_index = jnp.array(sample_adata.uns["scCODA_params"]["reference_index"])
+        region_labels_onehot = jnp.array(sample_adata.obsm["region_labels"], dtype=dtype)
+        cell_type_region_mask = jnp.array(sample_adata.obsm["cell_type_region_mask"], dtype=dtype)
 
         if rng_key is None:
             rng = np.random.default_rng()
             rng_key = random.key(rng.integers(0, 10000))
 
+        
+        # Generate posterior predictive samples
         if use_posterior_predictive:
             posterior_predictive = Predictive(self.model, self.mcmc.get_samples())(
                 rng_key,
@@ -388,11 +468,13 @@ class Sccoda(CompositionalModel2):
                 covariates=numpyro_covariates,
                 n_total=numpyro_n_total,
                 ref_index=ref_index,
-                sample_adata=sample_adata,
+                region_labels_onehot=region_labels_onehot,  # Pass region labels
+                cell_type_region_mask=cell_type_region_mask,
             )
         else:
             posterior_predictive = None
-
+        
+        # Generate prior samples
         if num_prior_samples > 0:
             prior = Predictive(self.model, num_samples=num_prior_samples)(
                 rng_key,
@@ -400,22 +482,25 @@ class Sccoda(CompositionalModel2):
                 covariates=numpyro_covariates,
                 n_total=numpyro_n_total,
                 ref_index=ref_index,
-                sample_adata=sample_adata,
+                region_labels_onehot=region_labels_onehot,  # Pass region labels
+                cell_type_region_mask=cell_type_region_mask,
             )
         else:
             prior = None
 
         # Create arviz object
+        
         arviz_data = az.from_numpyro(
-            self.mcmc, prior=prior, posterior_predictive=posterior_predictive, dims=dims, coords=coords
+            self.mcmc, prior=prior, posterior_predictive=posterior_predictive, dims=dims, coords=coords, num_chains=25,
         )
-
+    
         return arviz_data
 
     def run_nuts(
         self,
         data: AnnData | MuData,
         modality_key: str = "coda",
+        num_chains: int = 1,
         num_samples: int = 10000,
         num_warmup: int = 1000,
         rng_key: int = 0,
@@ -437,7 +522,7 @@ class Sccoda(CompositionalModel2):
             >>> mdata = sccoda.prepare(mdata, formula="condition", reference_cell_type="Endocrine")
             >>> sccoda.run_nuts(mdata, num_warmup=100, num_samples=1000, rng_key=42)
         """
-        return super().run_nuts(data, modality_key, num_samples, num_warmup, rng_key, copy, *args, **kwargs)
+        return super().run_nuts(data, modality_key, num_chains, num_samples, num_warmup, rng_key, copy, *args, **kwargs)
 
     run_nuts.__doc__ = CompositionalModel2.run_nuts.__doc__ + run_nuts.__doc__
 
