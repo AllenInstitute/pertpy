@@ -364,6 +364,8 @@ class Sccoda(CompositionalModel2):
         modality_key: str = "coda",
         num_samples: int = 10000,
         num_warmup: int = 1000,
+        num_chains: int = 1,
+        chain_method: str = "vectorized",
         rng_key: int = 0,
         copy: bool = False,
         *args,
@@ -384,7 +386,9 @@ class Sccoda(CompositionalModel2):
             >>> mdata = sccoda.prepare(mdata, formula="condition", reference_cell_type="Endocrine")
             >>> sccoda.run_nuts(mdata, num_warmup=100, num_samples=1000, rng_key=42).
         """  # noqa: D205, D212
-        return super().run_nuts(data, modality_key, num_samples, num_warmup, rng_key, copy, *args, **kwargs)
+        return super().run_nuts(
+            data, modality_key, num_samples, num_warmup, num_chains, chain_method, rng_key, copy, *args, **kwargs
+        )
 
     run_nuts.__doc__ = CompositionalModel2.run_nuts.__doc__ + run_nuts.__doc__
 
