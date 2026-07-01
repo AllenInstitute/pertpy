@@ -321,7 +321,7 @@ class CompositionalModel2(ABC):
         acc_rate = float(np.mean(self.mcmc.last_state.mean_accept_prob))
         if acc_rate < 0.6:
             logger.warning(
-                f"Acceptance rate unusually low ({acc_rate} < 0.5)! Results might be incorrect! "
+                f"Acceptance rate unusually low ({acc_rate} < 0.6)! Results might be incorrect! "
                 f"Please check feasibility of results and re-run the sampling step with a different rng_key if necessary."
             )
         if acc_rate > 0.95:
@@ -1000,7 +1000,9 @@ class CompositionalModel2(ABC):
             table.add_row(
                 "Acceptance rate",
                 "{ar:.1f}%".format(
-                    ar=(100 * sample_adata.uns["scCODA_params"]["mcmc"]["acceptance_rate"]),
+                    # Average across chains: `acceptance_rate` is a per-chain array when
+                    # num_chains > 1, which a scalar format spec cannot render.
+                    ar=(100 * float(np.mean(sample_adata.uns["scCODA_params"]["mcmc"]["acceptance_rate"]))),
                 ),
             )
         console.print(table)

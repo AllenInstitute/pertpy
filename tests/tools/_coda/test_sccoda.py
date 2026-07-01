@@ -93,6 +93,9 @@ def test_run_nuts_multichain(adata):
     # make_arviz must reshape the stored (flattened) samples back into 2 chains.
     arviz_data = sccoda.make_arviz(mdata, num_prior_samples=0, use_posterior_predictive=False)
     assert arviz_data.posterior.sizes["chain"] == 2
+    # summary(extended=True) formats the acceptance rate, which is a per-chain array when
+    # num_chains > 1; guards against the array-vs-scalar format TypeError.
+    sccoda.summary(mdata, extended=True)
 
 
 def test_credible_effects(adata):

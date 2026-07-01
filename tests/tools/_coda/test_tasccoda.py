@@ -98,6 +98,9 @@ def test_run_nuts_multichain(smillie_adata):
     tasccoda.run_nuts(mdata, num_samples=1000, num_warmup=100, num_chains=2)
     assert mdata["coda"].uns["scCODA_params"]["mcmc"]["num_chains"] == 2
     assert "effect_df_Health[T.Inflamed]" in mdata["coda"].varm
+    # summary(extended=True) formats the acceptance rate, which is a per-chain array when
+    # num_chains > 1; guards against the array-vs-scalar format TypeError.
+    tasccoda.summary(mdata, extended=True)
 
 
 def test_theta_fixed_not_collapsed(smillie_adata):
