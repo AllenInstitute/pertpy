@@ -23,7 +23,6 @@ from scipy.optimize import nnls
 from seaborn import PairGrid
 from sklearn.linear_model import LinearRegression
 from sparsecca import lp_pmd, multicca_permute, multicca_pmd
-from statsmodels.sandbox.stats.multicomp import multipletests
 
 from pertpy._doc import _doc_params, doc_common_plot_args
 
@@ -894,7 +893,7 @@ class Dialogue:
                 tstats.loc[celltype, mcpnum] = res[0]
 
         for mcpnum in ["mcp_" + str(n) for n in range(0, n_mcps)]:
-            pvals_adj[mcpnum] = multipletests(pvals[mcpnum], method="fdr_bh")[1]
+            pvals_adj[mcpnum] = ssm.multipletests(pvals[mcpnum], method="fdr_bh")[1]
 
         return {"pvals": pvals, "tstats": tstats, "pvals_adj": pvals_adj}
 

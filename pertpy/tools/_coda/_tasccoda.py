@@ -587,6 +587,7 @@ class Tasccoda(CompositionalModel2):
         self,
         data: AnnData | MuData,
         modality_key: str = "coda",
+        num_chains: int = 1,
         num_samples: int = 10000,
         num_warmup: int = 1000,
         rng_key: int = 0,
@@ -609,7 +610,7 @@ class Tasccoda(CompositionalModel2):
             >>> )
             >>> tasccoda.run_nuts(mdata, num_samples=1000, num_warmup=100, rng_key=42)
         """
-        return super().run_nuts(data, modality_key, num_samples, num_warmup, rng_key, copy, *args, **kwargs)
+        return super().run_nuts(data, modality_key, num_chains, num_samples, num_warmup, rng_key, copy, *args, **kwargs)
 
     run_nuts.__doc__ = CompositionalModel2.run_nuts.__doc__ + run_nuts.__doc__
 

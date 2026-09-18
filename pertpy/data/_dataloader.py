@@ -49,6 +49,7 @@ def _download(  # pragma: no cover
         temp_file_name = f"{download_to_path}.part"
 
         response = requests.get(url, stream=True)
+        response.raise_for_status()
         total = int(response.headers.get("content-length", 0))
 
         with Progress(refresh_per_second=100) as progress:

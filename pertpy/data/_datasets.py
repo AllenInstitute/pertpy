@@ -149,7 +149,7 @@ def tasccoda_example() -> AnnData:  # pragma: no cover
     output_file_path = settings.datasetdir / output_file_name
     if not Path(output_file_path).exists():
         _download(
-            url="https://figshare.com/ndownloader/files/38648585",
+            url="https://ndownloader.figshare.com/files/38648585",
             output_file_name=output_file_name,
             output_path=settings.datasetdir,
             is_zip=False,
@@ -453,7 +453,7 @@ def haber_2017_regions() -> AnnData:  # pragma: no cover
     output_file_path = settings.datasetdir / output_file_name
     if not Path(output_file_path).exists():
         _download(
-            url="https://figshare.com/ndownloader/files/38169900",
+            url="https://ndownloader.figshare.com/files/38169900",
             output_file_name=output_file_name,
             output_path=settings.datasetdir,
             is_zip=False,

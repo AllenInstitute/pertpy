@@ -55,6 +55,7 @@ dependencies = [
     "requests",
     "scikit-misc",
     "scvi-tools",
+    "flax",  # scvi-tools eagerly imports its Jax backend (scvi.train._trainingplans) without declaring this itself
     "adjusttext",
     "decoupler",
     "ott-jax",
@@ -72,7 +73,8 @@ coda = [
     "toytree",
     "arviz",
     "ete3",
-    "pyqt5"  # remove this after ete4 got released
+    "pyqt5",  # remove this after ete4 got released
+    "numpyro",
 ]
 de = [
     "formulaic-contrasts>=0.2.0",

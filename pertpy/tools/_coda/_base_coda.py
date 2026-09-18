@@ -194,6 +194,7 @@ class CompositionalModel2(ABC):
         kernel: npy.infer.mcmc.MCMCKernel,
         rng_key: Array,
         copy: bool = False,
+        chain_method: str = "vectorized",
         *args,
         **kwargs,
     ):
@@ -234,7 +235,7 @@ class CompositionalModel2(ABC):
 
 
         # Create mcmc attribute and run inference
-        self.mcmc = MCMC(kernel, chain_method="vectorized", *args, **kwargs)
+        self.mcmc = MCMC(kernel, chain_method=chain_method, *args, **kwargs)
         self.mcmc.run(
             rng_key,
             numpyro_counts,
@@ -293,6 +294,7 @@ class CompositionalModel2(ABC):
         num_warmup: int = 1000,
         rng_key: int = 0,
         copy: bool = False,
+        chain_method: str = "vectorized",
         *args,
         **kwargs,
     ):
@@ -305,6 +307,7 @@ class CompositionalModel2(ABC):
             num_warmup: Number of burn-in (warmup) samples.
             rng_key: The rng state used.
             copy: Return a copy instead of writing to adata.
+            chain_method: Passed to `numpyro.infer.mcmc.MCMC` ("parallel", "sequential", or "vectorized").
 
         Returns:
             Calls `self.__run_mcmc`
@@ -335,7 +338,14 @@ class CompositionalModel2(ABC):
         sample_adata.uns["scCODA_params"]["mcmc"]["algorithm"] = "NUTS"
 
         return self.__run_mcmc(
-            sample_adata, nuts_kernel, num_chains=num_chains, num_samples=num_samples, num_warmup=num_warmup, rng_key=rng_key_array, copy=copy
+            sample_adata,
+            nuts_kernel,
+            num_chains=num_chains,
+            num_samples=num_samples,
+            num_warmup=num_warmup,
+            rng_key=rng_key_array,
+            copy=copy,
+            chain_method=chain_method,
         )
 
     def run_hmc(
@@ -695,8 +705,7 @@ class CompositionalModel2(ABC):
             sample_adata.uns["scCODA_params"]["threshold_prob"][mcmc_beta_key] = threshold
 
         effect_df.loc[:, "final_parameter"] = effect_df.loc[:, "mean_nonzero"]
-        )
-        
+
         return effect_df
 
     def summary(self, data: AnnData | MuData, extended: bool = False, modality_key: str = "coda", *args, **kwargs):
@@ -970,8 +979,9 @@ class CompositionalModel2(ABC):
                     effect_dfs.append(sample_adata.varm[f"effect_df_{region}_{cov}"])
             effect_df = pd.concat(effect_dfs)
             effect_df.index = pd.MultiIndex.from_product(
-                (covariates, sample_adata.var.index.tolist()), names=["Region", "Covariate", "Cell Type"]
+                (region_names, covariates, sample_adata.var.index.tolist()), names=["Region", "Covariate", "Cell Type"]
             )
+            eff_df = effect_df
 
         out = eff_df["Final Parameter"] != 0
         out.rename("credible change")
